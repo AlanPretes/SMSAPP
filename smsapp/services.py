@@ -4,187 +4,119 @@ import subprocess
 import time
 import shlex
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
+import re
+import os
+from django_q.tasks import async_task
 
 from django.utils import timezone
 from smsapp.models import SmsQueue, SmsProcessing, SmsFailed, SmsSent
 
-lock = threading.Lock()
+from django_q.tasks import schedule
+from django_q.models import Schedule
 
-def delete_message_by_id(sms_id):
+os.environ.setdefault("adb", r"C:\adb\adb.exe")
+adb_path = os.environ.get("adb")
+
+def run():
+    obj_sms = SmsQueue.objects.all().order_by('created_at')[:15]
+
+    for sms in obj_sms:
+        send_sms_via_adb(sms)
+
+def send_sms_via_adb(obj_sms):
+    phone = obj_sms.phone
+    message = obj_sms.message
     """
-    Exclui a mensagem do celular Android, onde sms_id é o _id da mensagem.
-    """
-    comando = f'adb shell content delete --uri content://sms --where \"_id={sms_id}\"'
-    resultado = subprocess.run(comando, shell=True, capture_output=True, text=True)
-
-    # Opcional: verificar resultado
-    if resultado.returncode == 0:
-        # Comando rodou com sucesso. 
-        # Não há necessariamente uma confirmação formal de que foi deletado, 
-        # mas se returncode=0, em geral deu certo.
-        return True
-    else:
-        # Não foi possível deletar (talvez já não exista, 
-        # ou o Android não permitiu). 
-        return False
-
-def get_message_by_id(sms_id):
-    """
-    Consulta o SMS pelo _id usando ADB e retorna os dados como dict.
-    Retorna None se não encontrar.
-    """
-    comando = f'adb shell content query --uri content://sms --where \"_id={sms_id}\"'
-    resultado = subprocess.run(comando, shell=True, capture_output=True, text=True)
-
-    if not resultado.stdout.strip():
-        return None
-
-    # Lê cada linha do resultado
-    for line in resultado.stdout.splitlines():
-        # Verifica se estamos no SMS certo
-        if f'_id={sms_id}' in line:
-            info = {
-                'status': -1,
-                'error_code': 0
-            }
-            # status=
-            if 'status=' in line:
-                try:
-                    si = line.index('status=') + len('status=')
-                    sc = line.find(',', si)
-                    st_str = line[si:sc].strip() if sc != -1 else line[si:].strip()
-                    info['status'] = int(st_str)
-                except:
-                    pass
-
-            # error_code=
-            if 'error_code=' in line:
-                try:
-                    ei = line.index('error_code=') + len('error_code=')
-                    ec = line.find(',', ei)
-                    err_str = line[ei:ec].strip() if ec != -1 else line[ei:].strip()
-                    info['error_code'] = int(err_str)
-                except:
-                    pass
-
-            return info
-
-    return None
-
-def normalize_number(phone):
-    return ''.join(c for c in phone if c.isdigit())
-
-def send_sms_via_adb(phone, message):
-    """
-    Função para enviar via ADB,
-    retornando (thread_id, sms_id) ou (None, None) se falhar ao capturar o _id.
+    Envia a mensagem via ADB e retorna (thread_id, sms_id) se o SMS sumir dos logs (envio concluído)
+    ou (None, None) se o SMS continuar nos logs (falha no envio).
     """
     message_escaped = shlex.quote(message)
     comando_adb = (
-        f'adb shell am start -a android.intent.action.SENDTO -d "sms:{phone}" '
+        f'{adb_path} shell am start -a android.intent.action.SENDTO -d "sms:{phone}" '
         f'--es "sms_body" {message_escaped} --ez exit_on_sent true'
     )
-    subprocess.run(comando_adb, shell=True)
+    subprocess.run(comando_adb)
     time.sleep(1)  # tempo para abrir o app de SMS
 
-    # Tocar no botão 'Enviar'
+    # Toca no botão "Enviar"
     x, y = 999, 2137
-    subprocess.run(['adb', 'shell', 'input', 'tap', str(x), str(y)])
-    time.sleep(1)  # aguarda registrar
+    subprocess.run([adb_path, 'shell', 'input', 'tap', str(x), str(y)])
+    time.sleep(2)  # tempo para o SMS ser registrado nos logs
 
-    # Tenta capturar o _id (e thread_id)
-    for _ in range(3):
-        sms_id, th_id = get_last_inserted_id_for_phone(phone)
-        if sms_id is not None:
-            return (th_id, sms_id)  # Retorna uma tupla (thread_id, sms_id)
-        time.sleep(1)
+    # Captura inicial do SMS nos logs
+    sms_id_inicial = get_last_inserted_id_for_message(str(phone), str(message))
+    print(sms_id_inicial)
+    
+    if sms_id_inicial:
+        print("Tentativa de envio SMS criado!")
+        return sms_id_inicial
 
-    return None, None
+    print("Falha no envio")
+    return None 
 
-def get_last_inserted_id_for_phone(phone):
+def get_last_inserted_id_for_message(phone, message):
     """
-    Retorna (newest_id, best_th_id) para o número especificado,
-    considerando o SMS com maior 'date'.
+    Retorna o SMS_ID do último SMS enviado nos últimos 10 segundos para o número e mensagem fornecidos.
+    Se não encontrar, retorna None.
     """
-    comando = 'adb shell content query --uri content://sms'
+    # Escapar aspas simples para evitar problemas no comando
+    safe_message = message.replace("'", "\\'")
+    safe_phone = phone.replace("'", "\\'")
+
+    # Montar o comando correto
+    comando = (
+        f'{adb_path} shell "content query --uri content://sms/sent '
+        f'--projection _id,body,date,address --where \\"body=\'{safe_message}\' AND address=\'{safe_phone}\'\\""'
+    )
+
+    # Executar o comando
     resultado = subprocess.run(comando, shell=True, capture_output=True, text=True)
-    alvo = normalize_number(phone)
 
-    newest_id = None
-    best_th_id = None
-    newest_date = -1
+    # Exibir o resultado bruto para depuração
+    print("Resultado do comando ADB:\n", resultado.stdout)
 
-    for line in resultado.stdout.splitlines():
-        if "address=" not in line:
-            continue
-
-        address_val = get_address_from_line(line)
-        if not address_val:
-            continue
-
-        addr_norm = normalize_number(address_val)
-        if addr_norm.endswith(alvo) or alvo.endswith(addr_norm):
-            current_id, current_date, current_th_id = get_id_and_date_from_line(line)
-            if current_id and current_date > newest_date:
-                newest_id = current_id
-                newest_date = current_date
-                best_th_id = current_th_id
-
-    return newest_id, best_th_id
-
-def get_address_from_line(line):
-    if "address=" not in line:
-        return None
-    try:
-        start = line.index("address=") + len("address=")
-        end = line.find(",", start)
-        return line[start:end].strip() if end != -1 else line[start:].strip()
-    except:
+    # Verificar se há saída válida
+    if not resultado.stdout.strip():
+        print("Nenhum resultado encontrado.")
         return None
 
-def get_id_and_date_from_line(line):
-    """
-    Retorna (current_id, current_date, current_th_id).
-    """
-    current_id = None
-    current_th_id = None
-    current_date = 0
+    # Calcular o limite de tempo (últimos 10 segundos)
+    agora = datetime.now()
 
-    # thread_id=
-    if "thread_id=" in line:
-        try:
-            z1 = line.index("thread_id=") + len("thread_id=")
-            z2 = line.find(",", z1)
-            if z2 == -1:
-                current_th_id = int(line[z1:].strip())
-            else:
-                current_th_id = int(line[z1:z2].strip())
-        except:
-            pass
+    # Inicializar o ID e o timestamp do SMS mais recente
+    sms_id_mais_recente = None
+    data_mais_recente = datetime.min
 
-    # _id=
-    if "_id=" in line:
-        try:
-            i1 = line.index("_id=") + len("_id=")
-            i2 = line.find(",", i1)
-            if i2 == -1:
-                current_id = int(line[i1:].strip())
-            else:
-                current_id = int(line[i1:i2].strip())
-        except:
-            pass
+    # Percorrer todas as linhas para encontrar o SMS válido mais recente
+    for linha in resultado.stdout.splitlines():
+        match = re.search(r'_id=(\d+), body=(.*?), date=(\d+), address=([\+\d]+)', linha)
+        if match:
+            sms_id = int(match.group(1))
+            body = match.group(2)
+            date_millis = int(match.group(3))  # Timestamp em milissegundos
+            address = match.group(4)
 
-    # date=
-    if "date=" in line:
-        try:
-            d1 = line.index("date=") + len("date=")
-            d2 = line.find(",", d1)
-            if d2 == -1:
-                current_date = int(line[d1:].strip())
-            else:
-                current_date = int(line[d1:d2].strip())
-        except:
-            pass
+            # Converter o timestamp para datetime
+            data_sms = datetime.fromtimestamp(date_millis / 1000)
+            print(data_sms)
+            print(data_mais_recente)
+            print((agora - data_sms).total_seconds())
+            print(f"SMS encontrado no smartphone: ID={sms_id}, Data={data_sms}, Mensagem='{body}'")
 
-    return current_id, current_date, current_th_id
+            # Verificar se o SMS foi enviado nos últimos 10 segundos
+            if (agora - data_sms).total_seconds() < 15:
+                sms_id_mais_recente = sms_id
+                data_mais_recente = data_sms
+                break
+
+    if sms_id_mais_recente:
+        print(f"Última tentativa de envio de SMS nos últimos 10 segundos: ID={sms_id_mais_recente}, Data={data_mais_recente}")
+        return sms_id_mais_recente
+    else:
+        print("Nenhuma tentantiva de SMS encontrado nos últimos 10 segundos.")
+        return None
+    
+    
+    
+    
